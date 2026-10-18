@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#fafaf8">
+  <title>Выше пробок — электрический раннер</title>
+  <style>
+    :root { color-scheme: light dark; background: #fafaf8; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; overscroll-behavior: none; }
+    body { font-family: Arial, Helvetica, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; height: 100dvh; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; outline: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+  </style>
+</head>
+<body>
+  <h1 class="sr-only">Выше пробок</h1>
+  <p id="instructions" class="sr-only">Нажмите на экран, пробел или стрелку вверх, чтобы съехать с рампы. Удерживайте для подъёма, отпускайте для снижения. Перелетайте светофоры и весь транспорт. Воздух восстанавливается на земле. Escape — пауза, T — смена темы. После столкновения нажмите, чтобы вернуться на стартовую рампу.</p>
+  <canvas id="game" tabindex="0" role="application" aria-label="Выше пробок. Бесконечный электрический раннер" aria-describedby="instructions">Для игры нужен браузер с поддержкой canvas и JavaScript.</canvas>
+  <p id="announcement" class="sr-only" aria-live="polite"></p>
+  <script>
+  (() => {
+    'use strict';
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    if (!ctx) return;
+    const announcer = document.getElementById('announcement');
+    const TAU = Math.PI * 2;
+    const STEP = 1 / 120; // Fixed physics steps prevent tunnelling at low frame rates.
+    const AIR_DRAIN = 0.25, AIR_REFILL = 0.72;
+    const START_SPEED = 300, MAX_SPEED = 505, MAX_ALTITUDE = 222;
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const mix = (a, b, t) => a + (b - a) * t;
+    const random = (a, b) => a + Math.random() * (b - a);
+    const store = {
+      get(key) { try { return localStorage.getItem('above-traffic:' + key); } catch (_) { return null; } },
+      set(key, value) { try { localStorage.setItem('above-traffic:' + key, String(value)); } catch (_) {} }
+    };
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    let themeChoice = store.get('theme');
+    let dark = themeChoice ? themeChoice === 'dark' : media.matches;
+    let best = Math.max(0, Number(store.get('best')) || 0);
+    if (!Number.isFinite(best)) best = 0;
+    let palette, width = 0, height = 0, dpr = 1, margin, scale, ground, anchor;
+    let state = 'ready', previousState = 'running', elapsed = 0, gameTime = 0;
+    let speed = START_SPEED, distance = 0, camera = 0, air = 1, exhausted = false;
+    let rampDistance = 0, rampSpeed = 64, nextSignal = 0, deathTime = 0;
+    let obstacles = [], jams = [], ui = {}, accumulator = 0, lastFrame = 0;
+    let isRecord = false, bestAtStart = best;
+    const keys = new Set(), pointers = new Set();
+    // Tall drop from the reference ramp: short lip, then a steep elliptical quarter-turn.
+    const RAMP_A = 152, RAMP_B = 198, RAMP_TOP = -2 * RAMP_B;
+    const DECK_X = 62, RAMP_LIP = 146, PLAYER_START_X = 108;
+    const player = { x: PLAYER_START_X, altitude: 0, vy: 0, y: RAMP_TOP, angle: 0, wheel: 0, thrust: false };
+    const held = () => keys.size > 0 || pointers.size > 0;
+    const font = 'Arial, Helvetica, sans-serif';
+    const mono = '"Courier New", monospace';
+
+    function applyTheme() {
+      palette = dark
+        ? { bg: '#151615', ink: '#efefea', muted: '#92948f', faint: '#343632', soft: '#232521', jet: '#a4a69e', red: '#e8796b' }
+        : { bg: '#fafaf8', ink: '#191b19', muted: '#82867e', faint: '#dedfd8', soft: '#efefe9', jet: '#9a9e95', red: '#c65849' };
+      document.documentElement.style.background = palette.bg;
+      document.querySelector('meta[name="theme-color"]').content = palette.bg;
+    }
+    function toggleTheme() {
+      dark = !dark;
+      themeChoice = dark ? 'dark' : 'light';
+      store.set('theme', themeChoice);
+      applyTheme();
+    }
+    const systemTheme = event => { if (!themeChoice) { dark = event.matches; applyTheme(); } };
+    if (media.addEventListener) media.addEventListener('change', systemTheme);
+
+    // Sampled by arc length, so speed never depends on how the curve is parameterized.
+    const ramp = [];
+    function rampPoint(x, y) {
+      const prev = ramp[ramp.length - 1];
+      ramp.push({ x, y, s: prev ? prev.s + Math.hypot(x - prev.x, y - prev.y) : 0 });
+    }
+    rampPoint(DECK_X, RAMP_TOP);
+    rampPoint(RAMP_LIP, RAMP_TOP);
+    for (let i = 1; i <= 70; i++) {
+      const t = (i / 70) * Math.PI / 2;
+      rampPoint(RAMP_LIP + RAMP_A * Math.sin(t), RAMP_TOP + RAMP_B * (1 - Math.cos(t)));
+    }
+    for (let i = 1; i <= 70; i++) {
+      const t = (i / 70) * Math.PI / 2;
+      rampPoint(RAMP_LIP + RAMP_A + RAMP_A * (1 - Math.cos(t)), -RAMP_B + RAMP_B * Math.sin(t));
+    }
+    const deckCount = ramp.length;
+    rampPoint(RAMP_LIP + RAMP_A * 2 + 210, 0);
+    const rampLength = ramp[ramp.length - 1].s;
+    const startRampDistance = PLAYER_START_X - DECK_X;
+    function trackAt(s) {
+      s = clamp(s, 0, rampLength);
+      let lo = 0, hi = ramp.length - 1;
+      while (lo + 1 < hi) {
+        const mid = (lo + hi) >> 1;
+        if (ramp[mid].s < s) lo = mid; else hi = mid;
+      }
+      const a = ramp[lo], b = ramp[hi], t = (s - a.s) / (b.s - a.s || 1);
+      return { x: mix(a.x,b.x,t), y: mix(a.y,b.y,t), angle: Math.atan2(b.y-a.y,b.x-a.x) };
+    }
+    function resize() {
+      width = Math.max(280, window.innerWidth);
+      height = Math.max(280, window.innerHeight);
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      margin = width < 600 ? 24 : clamp(width * 0.055, 32, 88);
+      const portrait = width < 760 && height >= 540;
+      ground = height * (portrait ? 0.775 : 0.745);
+      const availableTop = portrait ? Math.min(295, height * .47) : (height < 500 ? 104 : 165);
+      scale = Math.min(clamp(width / 1160, 0.52, 1.2), Math.max(.28, (ground - availableTop) / 490));
+      anchor = (width * (portrait ? 0.22 : 0.245) - margin) / scale;
+      if (state === 'running') camera = player.x - anchor;
+    }
+    function announce(text) { announcer.textContent = text; }
+    function reset() {
+      state = 'ready'; previousState = 'running';
+      keys.clear(); pointers.clear();
+      air = 1; exhausted = false; distance = 0; gameTime = 0; camera = 0;
+      speed = START_SPEED; rampSpeed = 64; rampDistance = startRampDistance;
+      obstacles = []; jams = []; isRecord = false; bestAtStart = best;
+      Object.assign(player, { x:PLAYER_START_X, y:RAMP_TOP, altitude:0, vy:0, angle:0, wheel:0, thrust:false });
+      accumulator = 0;
+      announce('Машина на верхней площадке. Нажмите, чтобы начать заезд.');
+    }
+    function start() {
+      state = 'intro';
+      announce('Спуск с рампы. После спуска удерживайте управление для взлёта.');
+    }
+    function beginRun() {
+      state = 'running';
+      player.altitude = 0; player.vy = 0; player.y = 0; player.angle = 0;
+      speed = START_SPEED;
+      nextSignal = player.x + Math.max((width - margin) / scale - anchor + 180, speed * 3.5);
+      createJam();
+      announce('Заезд начался. Перелетайте пробки целиком.');
+    }
+    function pause() {
+      if (state !== 'running' && state !== 'intro') return;
+      previousState = state; state = 'paused';
+      keys.clear(); pointers.clear(); player.thrust = false;
+      announce('Пауза. Нажмите, чтобы продолжить.');
+    }
+    function resume() {
+      if (state !== 'paused') return;
+      state = previousState; accumulator = 0; lastFrame = performance.now();
+      announce('Продолжаем.');
+    }
+    function crash() {
+      state = 'dead'; player.thrust = false; deathTime = elapsed;
+      keys.clear(); pointers.clear();
+      const score = Math.floor(distance / 12);
+      isRecord = score > bestAtStart;
+      if (score > best) { best = score; store.set('best', best); }
+      announce('Врезался. Результат: ' + score + ' метров. Ещё раз? Нажмите, чтобы вернуться на рампу.');
+    }
+
+    const rect = (x,y,w,h) => [[x,y],[x+w,y],[x+w,y+h],[x,y+h]];
+    const circlePoly = (x,y,r) => Array.from({length:12}, (_,i) => [x+Math.cos(i*TAU/12)*r,y+Math.sin(i*TAU/12)*r]);
+    const vehicleTypes = {
+      moped: { name:'мопед', w:43, h:44, wheels:[9,34], r:8, bike:true },
+      bike: { name:'спортивный мотоцикл', w:61, h:39, wheels:[11,48], r:10, bike:true },
+      sedan: { name:'седан', w:85, h:43, wheels:[17,68], r:10, roof:[[20,-24],[32,-41],[57,-41],[72,-24]] },
+      suv: { name:'кроссовер', w:91, h:55, wheels:[18,73], r:12, roof:[[14,-28],[25,-53],[65,-53],[78,-28]] },
+      pickup: { name:'пикап', w:100, h:51, wheels:[20,80], r:12, roof:[[41,-28],[44,-49],[67,-49],[82,-28]] },
+      coupe: { name:'купе', w:81, h:37, wheels:[17,65], r:10, roof:[[18,-22],[35,-35],[51,-35],[69,-22]] }
+    };
+    const typeNames = Object.keys(vehicleTypes);
+    function geometry(type) {
+      const v = vehicleTypes[type];
+      const polys = v.wheels.map(x => circlePoly(x,-v.r,v.r));
+      if (type === 'moped') {
+        polys.push([[8,-22],[16,-25],[23,-13],[32,-13],[29,-8],[16,-8]]);
+        polys.push([[28,-12],[30,-37],[34,-39],[36,-11]], rect(8,-29,13,5), rect(26,-43,10,4));
+      } else if (type === 'bike') {
+        polys.push([[11,-18],[20,-30],[34,-33],[44,-22],[34,-11],[19,-13]]);
+        polys.push([[42,-10],[36,-36],[40,-37],[49,-10]],rect(10,-31,16,5));
+      } else {
+        const deck = type === 'suv' || type === 'pickup' ? -29 : -25;
+        polys.push([[2,-12],[2,deck],[v.w-19,deck],[v.w-2,deck+8],[v.w,-12],[v.w-5,-9],[5,-9]]);
+        polys.push(v.roof);
+      }
+      return polys;
+    }
+    const vehicleGeometry = Object.fromEntries(typeNames.map(type => [type,geometry(type)]));
+    // Convex pieces of the wedge: low nose, dark canopy, two wheels. The roof pod is visual only.
+    const playerGeometry = [
+      [[66,-13],[30,-20],[-18,-22],[-54,-16],[-52,-12],[56,-12]],
+      [[24,-20],[8,-30],[-20,-34],[-38,-26],[-22,-20]],
+      circlePoly(-32,-11,11), circlePoly(42,-11,11)
+    ];
+    function bounds(polys) {
+      let left=Infinity, right=-Infinity, top=Infinity, bottom=-Infinity;
+      for (const poly of polys) for (const [x,y] of poly) {
+        left=Math.min(left,x); right=Math.max(right,x); top=Math.min(top,y); bottom=Math.max(bottom,y);
+      }
+      return {left,right,top,bottom};
+    }
+    function addObstacle(kind, x, type) {
+      const local = kind === 'signal'
+        ? [rect(0,-116,24,46),rect(10,-70,4,70),rect(2,-3,20,3)]
+        : vehicleGeometry[type];
+      const polygons = local.map(poly => poly.map(([px,py]) => [px+x,py]));
+      obstacles.push({kind,x,type,polygons,box:bounds(polygons)});
+    }
+    function createJam() {
+      const count = 1 + Math.floor(Math.random() * 6);
+      const startX = nextSignal;
+      addObstacle('signal',startX);
+      let x = startX + 52;
+      for (let i=0; i<count; i++) {
+        const type = typeNames[Math.floor(Math.random()*typeNames.length)];
+        addObstacle('vehicle',x,type);
+        x += vehicleTypes[type].w + random(12,18);
+      }
+      jams.push({start:startX,end:x,count});
+      // Enough tarmac to descend from maximum altitude and refill the reservoir.
+      nextSignal = x + speed * random(3.65,4.35) + 150;
+    }
+    function overlaps(a,b) {
+      return a.right>=b.left && a.left<=b.right && a.bottom>=b.top && a.top<=b.bottom;
+    }
+    function polygonHit(a,b) {
+      // Separating-axis test on convex parts: empty space over a hood is not a hit.
+      for (const poly of [a,b]) {
+        for (let i=0; i<poly.length; i++) {
+          const p=poly[i], q=poly[(i+1)%poly.length], nx=-(q[1]-p[1]), ny=q[0]-p[0];
+          let amin=Infinity,amax=-Infinity,bmin=Infinity,bmax=-Infinity;
+          for (const v of a) { const n=v[0]*nx+v[1]*ny; amin=Math.min(amin,n); amax=Math.max(amax,n); }
+          for (const v of b) { const n=v[0]*nx+v[1]*ny; bmin=Math.min(bmin,n); bmax=Math.max(bmax,n); }
+          if (amax<bmin || bmax<amin) return false;
+        }
+      }
+      return true;
+    }
+    function collisions() {
+      const c=Math.cos(player.angle), s=Math.sin(player.angle);
+      const polys=playerGeometry.map(poly => poly.map(([x,y]) => [player.x+x*c-y*s,player.y+x*s+y*c]));
+      const box=bounds(polys);
+      for (const obj of obstacles) {
+        if (!overlaps(box,obj.box)) continue;
+        for (const a of polys) for (const b of obj.polygons) {
+          if (polygonHit(a,b)) { crash(); return; }
+        }
+      }
+    }
+    function update(dt) {
+      elapsed += dt;
+      if (state === 'intro') {
+        const fraction = rampDistance / rampLength;
+        rampSpeed = Math.min(460, rampSpeed + (fraction > .43 ? 800 : 62) * dt);
+        rampDistance = Math.min(rampLength, rampDistance + rampSpeed * dt);
+        const pose=trackAt(rampDistance);
+        player.x=pose.x; player.y=pose.y; player.angle=pose.angle;
+        player.wheel += rampSpeed*dt/11;
+        const target=Math.max(0,player.x-anchor);
+        camera += (target-camera)*(1-Math.exp(-4.5*dt));
+        if (rampDistance>=rampLength) beginRun();
+      } else if (state === 'running') {
+        gameTime += dt;
+        speed = Math.min(MAX_SPEED,START_SPEED+gameTime*2.1);
+        const travel = speed*dt;
+        player.x += travel; distance += travel; player.wheel += travel/11;
+        if (!held() && air>.18) exhausted=false;
+        player.thrust = held() && !exhausted && air>0;
+        player.vy += ((player.thrust ? 1320 : 0)-560-2.4*player.vy)*dt;
+        player.vy = clamp(player.vy,-220,260);
+        player.altitude += player.vy*dt;
+        if (player.altitude>=MAX_ALTITUDE) { player.altitude=MAX_ALTITUDE; player.vy=Math.min(0,player.vy); }
+        if (player.altitude<=0) { player.altitude=0; player.vy=Math.max(0,player.vy); }
+        if (player.thrust) {
+          air=Math.max(0,air-AIR_DRAIN*dt);
+          if (air===0) { exhausted=true; player.thrust=false; }
+        } else if (player.altitude===0) air=Math.min(1,air+AIR_REFILL*dt);
+        const desiredAngle=player.altitude>1 ? clamp(-player.vy*.00048,-.105,.075) : 0;
+        player.angle += (desiredAngle-player.angle)*(1-Math.exp(-10*dt));
+        player.y = -player.altitude;
+        camera += (player.x-anchor-camera)*(1-Math.exp(-12*dt));
+        const visibleEnd=camera+(width-margin)/scale;
+        if (nextSignal<visibleEnd+350) createJam();
+        obstacles=obstacles.filter(obj=>obj.box.right>camera-160);
+        jams=jams.filter(jam=>jam.end>camera-180);
+        collisions();
+      }
+    }
+
+    function line(x1,y1,x2,y2,color=palette.ink,weight=1) {
+      ctx.strokeStyle=color; ctx.lineWidth=weight;
+      ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+    }
+    function poly(points,fill,stroke,weight=1.3) {
+      ctx.beginPath(); ctx.moveTo(points[0][0],points[0][1]);
+      for(let i=1;i<points.length;i++) ctx.lineTo(points[i][0],points[i][1]);
+      ctx.closePath();
+      if(fill) { ctx.fillStyle=fill; ctx.fill(); }
+      if(stroke) { ctx.strokeStyle=stroke; ctx.lineWidth=weight; ctx.stroke(); }
+    }
+    function circle(x,y,r,fill,stroke,weight=1) {
+      ctx.beginPath(); ctx.arc(x,y,r,0,TAU);
+      if(fill) {ctx.fillStyle=fill;ctx.fill();}
+      if(stroke) {ctx.strokeStyle=stroke;ctx.lineWidth=weight;ctx.stroke();}
+    }
+    function text(value,x,y,size=12,color=palette.ink,weight=400,align='left',family=font) {
+      ctx.font=weight+' '+size+'px '+family;
+      ctx.fillStyle=color; ctx.textAlign=align; ctx.textBaseline='alphabetic';
+      ctx.fillText(value,x,y);
+    }
+    function tracked(value,x,y,size=10,color=palette.muted,spacing=2) {
+      ctx.font='500 '+size+'px '+font; ctx.fillStyle=color;ctx.textAlign='left';ctx.textBaseline='alphabetic';
+      for(const char of value) {ctx.fillText(char,x,y);x+=ctx.measureText(char).width+spacing;}
+    }
+    function rounded(x,y,w,h,r,fill,stroke) {
+      ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+      ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+      if(fill){ctx.fillStyle=fill;ctx.fill();}
+      if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=1;ctx.stroke();}
+    }
+    function arrow(x,y,color=palette.ink,size=12) {
+      line(x,y,x+size,y-size,color,1.5);line(x+1,y-size,x+size,y-size,color,1.5);line(x+size,y-size,x+size,y-1,color,1.5);
+    }
+    function wheel(x,y,r,spin=0,solid=false) {
+      circle(x,y,r+1.6,palette.bg);
+      circle(x,y,r,solid?palette.ink:palette.bg,palette.ink,1.5);
+      circle(x,y,r*.69,null,solid?palette.muted:palette.faint,1);
+      for(let i=0;i<5;i++) {
+        const a=spin+i*TAU/5;
+        line(x+Math.cos(a)*2,y+Math.sin(a)*2,x+Math.cos(a)*r*.72,y+Math.sin(a)*r*.72,solid?palette.bg:palette.muted,1);
+      }
+      circle(x,y,1.9,solid?palette.bg:palette.ink);
+    }
+    const carBody = [
+      [68,-13],[56,-16],[44,-18],[30,-20],
+      [14,-27],[0,-32],[-14,-35],[-28,-33],
+      [-42,-26],[-52,-18],[-56,-14],[-52,-12],[60,-12]
+    ];
+    const carGlass = [[28,-20],[12,-27],[-2,-32],[-20,-33],[-34,-28],[-28,-21],[8,-20]];
+    const carSkirt = [[-50,-16],[50,-15],[58,-12],[-54,-12]];
+    function drawPlayer() {
+      ctx.save();ctx.translate(player.x,player.y);ctx.rotate(player.angle);
+      if(player.thrust && state==='running') {
+        const length=Math.min(48,player.altitude+1);
+        for(const origin of [-32,42]) {
+          ctx.fillStyle=palette.jet;ctx.fillRect(origin-10,-2,20,3);
+          for(let i=-3;i<=3;i++) {
+            const flutter=1+Math.sin(elapsed*32+i*2+origin)*.1;
+            line(origin+i*1.8,2,origin+i*4.6,length*flutter,palette.jet,.85);
+          }
+        }
+      }
+      poly(carBody,palette.ink);
+      poly(carGlass,palette.bg,palette.ink,1.2);
+      poly(carSkirt,dark?palette.bg:palette.ink);
+      line(-48,-16,48,-15,dark?palette.muted:palette.bg,1);
+      poly([[-18,-35],[-16,-39],[-13,-35]],palette.ink);
+      line(54,-15,64,-13,palette.bg,1.5);
+      line(-53,-16,-47,-16,palette.bg,1.6);
+      wheel(-32,-11,11,player.wheel,!dark);wheel(42,-11,11,player.wheel,!dark);
+      ctx.restore();
+    }
+    function drawVehicle(obj) {
+      const v=vehicleTypes[obj.type];
+      ctx.save();ctx.translate(obj.x,0);
+      if(v.bike) {
+        for(const p of vehicleGeometry[obj.type].slice(2)) poly(p,palette.bg,palette.ink,1.5);
+        if(obj.type==='moped') {
+          line(13,-10,22,-9,palette.ink,2);line(26,-43,36,-43,palette.ink,2);
+          circle(34,-35,3,palette.bg,palette.ink);
+        } else {
+          poly([[17,-24],[28,-31],[37,-30],[42,-22],[31,-16]],palette.ink);
+          line(36,-36,42,-37,palette.ink,2);line(8,-33,23,-31,palette.ink,2);
+          line(36,-35,37,-39,palette.muted,1.1);
+        }
+      } else {
+        for(const p of vehicleGeometry[obj.type].slice(2)) poly(p,palette.bg,palette.ink,1.5);
+        const roof=v.roof;
+        poly([[roof[0][0]+7,roof[0][1]-2],[roof[1][0]+3,roof[1][1]+4],[roof[2][0]-3,roof[2][1]+4],[roof[3][0]-7,roof[3][1]-2]],palette.soft,palette.ink,1);
+        const mid=(roof[1][0]+roof[2][0])*.5;
+        line(mid,roof[1][1]+4,mid,-13,palette.muted,.9);
+        line(mid+4,-23,mid+10,-23,palette.ink,1);
+        line(7,-16,v.w-5,-16,palette.faint,1);
+        line(v.w-10,-22,v.w-4,-21,palette.ink,1.4);
+        if(obj.type==='pickup') {line(7,-26,38,-26,palette.ink,1);line(39,-26,39,-13,palette.ink,1);}
+        if(obj.type==='suv') line(27,-56,63,-56,palette.ink,1.2);
+      }
+      for(const x of v.wheels) wheel(x,-v.r,v.r,0);
+      ctx.restore();
+    }
+    function drawSignal(obj) {
+      const x=obj.x;
+      ctx.fillStyle=palette.ink;ctx.fillRect(x+10,-71,4,71);ctx.fillRect(x+2,-3,20,3);
+      rounded(x,-116,24,46,4,palette.ink);
+      circle(x+12,-104,6.3,palette.red);
+      circle(x+12,-83,6,null,palette.muted,1.1);
+      line(x+4,-96,x+20,-96,palette.muted,.7);
+    }
+    function strokePath(points, color, weight) {
+      ctx.beginPath();ctx.moveTo(points[0][0],points[0][1]);
+      for (let i=1;i<points.length;i++) ctx.lineTo(points[i][0],points[i][1]);
+      ctx.strokeStyle=color;ctx.lineWidth=weight;ctx.stroke();
+    }
+    function drawRamp() {
+      if(camera>920) return;
+      const cols=[34,66,98,130], top=RAMP_TOP, storey=44;
+      ctx.fillStyle=palette.soft;ctx.fillRect(cols[0],top,cols[3]-cols[0],-top);
+      for(let y=top;y<-2;y+=storey) {
+        const y2=Math.min(0,y+storey);
+        line(cols[0],y,cols[3],y,palette.muted,1);
+        for(let c=0;c<3;c++) {
+          line(cols[c],y,cols[c+1],y2,palette.muted,1);
+          line(cols[c+1],y,cols[c],y2,palette.muted,1);
+        }
+      }
+      for(const x of cols) line(x,top,x,0,palette.ink,1.7);
+      ctx.fillStyle=palette.ink;
+      ctx.fillRect(cols[0]-8,-3,22,3);ctx.fillRect(cols[3]-12,-3,22,3);
+      line(cols[0],top,RAMP_LIP+6,top,palette.ink,1.7);
+      line(cols[3],top+18,RAMP_LIP,top+22,palette.muted,1);
+      line(cols[0]-18,top-26,cols[0],top,palette.faint,.7);
+      line(cols[3],top,cols[3]+64,top-34,palette.faint,.7);
+      const deck=ramp.slice(0,deckCount), thick=28;
+      const under=deck.map((p,i)=>{
+        const a=deck[Math.max(0,i-1)],b=deck[Math.min(deck.length-1,i+1)];
+        const angle=Math.atan2(b.y-a.y,b.x-a.x);
+        return [p.x-Math.sin(angle)*thick,p.y+Math.cos(angle)*thick];
+      });
+      poly([...deck.map(p=>[p.x,p.y]),...under.slice().reverse()],palette.soft);
+      for(let i=4;i<deck.length-6;i+=8) {
+        line(deck[i].x,deck[i].y,under[i][0],under[i][1],palette.muted,.8);
+        const j=Math.min(i+8,deck.length-1);
+        line(under[i][0],under[i][1],deck[j].x,deck[j].y,palette.muted,.8);
+      }
+      const mid=deck.map((p,i)=>[(p.x+under[i][0])/2,(p.y+under[i][1])/2]);
+      ctx.setLineDash([10,14]);strokePath(mid,palette.muted,.8);ctx.setLineDash([]);
+      strokePath(deck.map(p=>[p.x,p.y]),palette.red,2.4);
+      strokePath(under,palette.red,1.7);
+      line(30,top,30,top-32,palette.muted,1);
+      line(30,top-32,48,top-32,palette.muted,1);
+      if(state==='ready') {
+        tracked('СТАРТ',24,top-46,10,palette.muted,2.2);
+        line(cols[0]-16,top,cols[0]-16,-8,palette.faint,.9);
+        line(cols[0]-20,top,cols[0]-12,top,palette.muted,1);
+        line(cols[0]-20,-8,cols[0]-12,-8,palette.muted,1);
+        text('01',cols[0]-8,16,12,palette.muted,400,'left',mono);
+        text('Сначала — вниз.',RAMP_LIP+RAMP_A,22,12,palette.muted);
+      }
+    }
+    function drawScene() {
+      // Straight, quiet parallax strokes. No curves, audio or decorative waves.
+      const motion=camera*scale;
+      for(let i=0;i<13;i++) {
+        const span=width+240;
+        const x=((i*197.9-motion*(.12+(i%3)*.08))%span+span)%span-120;
+        const y=ground-(42+(i*47)%225)*scale;
+        line(x,y,x+24+(i%4)*21,y,palette.faint,.7);
+      }
+      ctx.save();ctx.translate(margin-camera*scale,ground);ctx.scale(scale,scale);
+      const start=camera-margin/scale, end=camera+(width-margin)/scale;
+      line(start,0,end,0,palette.ink,1.15);
+      ctx.setLineDash([13,19]);line(start,17,end,17,palette.muted,.8);ctx.setLineDash([]);
+      drawRamp();
+      for(const jam of jams) {
+        if(jam.start>end+80 || jam.end<start) continue;
+        text('ПРОБКА / '+String(jam.count).padStart(2,'0'),jam.start,-137,10,palette.muted,400,'left',mono);
+      }
+      for(const obj of obstacles) {
+        if(obj.box.left>end+110 || obj.box.right<start-110) continue;
+        if(obj.kind==='signal') drawSignal(obj);else drawVehicle(obj);
+      }
+      if(state==='running' && player.altitude>5) {
+        const size=32*(1-player.altitude/400);
+        line(player.x-size,1,player.x+size,1,palette.faint,2);
+      }
+      drawPlayer();
+      ctx.restore();
+    }
+    function themeIcon(x,y) {
+      circle(x,y,7,null,palette.ink,1.2);
+      ctx.save();ctx.beginPath();ctx.arc(x,y,7,-Math.PI/2,Math.PI/2);ctx.closePath();ctx.fillStyle=palette.ink;ctx.fill();ctx.restore();
+    }
+    function drawHeader() {
+      const short=height<500, top=short?30:43;
+      const compact=width<600;
+      line(margin,top+25,width-margin,top+25,palette.faint,1);
+      // The two ascending strokes are a typographic mark, not a vehicle emblem.
+      line(margin,top-3,margin+9,top-16,palette.ink,2);
+      line(margin+8,top-3,margin+17,top-16,palette.ink,2);
+      tracked('ВЫШЕ ПРОБОК',margin+30,top-3,compact?10:11,palette.ink,compact?1.7:2.3);
+      if(width>850) tracked('ЭЛЕКТРИЧЕСКИЙ РАННЕР',width*.5-92,top-3,9,palette.muted,1.6);
+      const themeX=width-margin-17;
+      ui.theme={x:themeX-22,y:top-30,w:44,h:44};
+      themeIcon(themeX,top-10);
+      if(width>650) text(dark?'ТЁМНАЯ':'СВЕТЛАЯ',themeX-23,top-6,9,palette.muted,500,'right');
+      if(state==='running'||state==='intro'||state==='paused') {
+        const px=themeX-(width>650?110:50);
+        ui.pause={x:px-22,y:top-30,w:44,h:44};
+        if(state==='paused') poly([[px-4,top-17],[px+5,top-10],[px-4,top-3]],palette.ink);
+        else {line(px-3,top-17,px-3,top-3,palette.ink,2);line(px+3,top-17,px+3,top-3,palette.ink,2);}
+      }
+      const y=short?83:107, barW=compact?110:148;
+      tracked('ВОЗДУХ',margin,y,9,palette.muted,1.7);
+      text(String(Math.round(air*100)).padStart(3,'0')+'%',margin+barW,y,10,palette.ink,400,'right',mono);
+      ctx.fillStyle=palette.faint;ctx.fillRect(margin,y+12,barW,3);
+      ctx.fillStyle=palette.ink;ctx.fillRect(margin,y+12,barW*air,3);
+      for(let i=1;i<5;i++) {ctx.fillStyle=palette.bg;ctx.fillRect(margin+barW*i/5-1,y+11,2,5);}
+      if(exhausted&&state==='running') text('Отпусти и дай пополниться',margin,y+33,9,palette.muted);
+      else if(state==='running'&&player.altitude===0&&air<.99) text('Пополняется на земле',margin,y+33,9,palette.muted);
+      const scoreX=width-margin;
+      text(String(Math.floor(distance/12)).padStart(5,'0'),scoreX-(compact?19:25),y+12,compact?27:36,palette.ink,400,'right',mono);
+      text('м',scoreX,y+11,12,palette.muted,400,'right');
+      text('РЕКОРД  '+String(Math.max(best,Math.floor(distance/12))).padStart(5,'0')+' м',scoreX,y+32,9,palette.muted,400,'right',mono);
+    }
+    function button(label,x,y,w=220,h=48) {
+      ctx.fillStyle=palette.ink;ctx.fillRect(x,y,w,h);
+      tracked(label,x+19,y+h/2+3,10,palette.bg,1.5);
+      arrow(x+w-35,y+h/2+6,palette.bg,11);
+      ui.action={x,y,w,h};
+    }
+    function drawReady() {
+      const portrait=width<760&&height>=540;
+      const short=height<500;
+      if(portrait) {
+        const x=margin, y=clamp(height*.19,110,168);
+        tracked('ОБХОДИ ЗЕМНОЕ ПРИТЯЖЕНИЕ',x,y,8,palette.muted,1.25);
+        text('Город стоит.',x,y+44,38,palette.ink,500);
+        text('Ты — выше.',x,y+85,38,palette.ink,500);
+        button('НАЧАТЬ ЗАЕЗД',x,y+108,213,44);
+      } else {
+        const x=width*.565, y=short?height*.41:height*.34;
+        const size=short?30:clamp(width*.044,40,68);
+        tracked('ОБХОДИ ЗЕМНОЕ ПРИТЯЖЕНИЕ',x,y-23,short?7:9,palette.muted,short?1:1.8);
+        text('Город стоит.',x,y+size*.62,size,palette.ink,500);
+        text('Ты — выше.',x,y+size*1.68,size,palette.ink,500);
+        if(!short) {
+          text('Электричество. Немного воздуха.',x,y+size*1.68+38,13,palette.muted);
+          text('И ни одной причины стоять в пробке.',x,y+size*1.68+59,13,palette.muted);
+        }
+        button('НАЧАТЬ ЗАЕЗД',x,y+size*1.68+(short?20:89),short?195:228,short?40:49);
+        if(!short) text('Нажми в любом месте, чтобы начать',x,y+size*1.68+162,10,palette.muted);
+      }
+    }
+    function drawFooter() {
+      if(height<500) {
+        text('Зажми — взлетай   /   Отпусти — снижайся',width*.5,height-19,10,palette.muted,400,'center');
+        return;
+      }
+      const y=height-85;
+      line(margin,y,width-margin,y,palette.faint,1);
+      if(width<760) {
+        text('Удерживай — взлетай. Отпускай — снижайся.',width/2,y+27,width<360?10:11,palette.ink,400,'center');
+        text('Воздух пополняется на дороге',width/2,y+49,10,palette.muted,400,'center');
+      } else {
+        rounded(margin,y+20,65,25,3,null,palette.faint);
+        text('ПРОБЕЛ',margin+32.5,y+36,8,palette.ink,400,'center',mono);
+        rounded(margin+72,y+20,26,25,3,null,palette.faint);
+        text('↑',margin+85,y+37,14,palette.ink,400,'center');
+        text('или удерживай экран',margin+111,y+36,11,palette.muted);
+        text('Зажми — выше',width*.50,y+36,11,palette.ink,400,'center');
+        text('Отпусти — ниже',width*.68,y+36,11,palette.ink,400,'center');
+        text('На земле — заправка',width-margin,y+36,11,palette.muted,400,'right');
+      }
+    }
+    function drawOverlay() {
+      const dead=state==='dead';
+      ctx.save();ctx.globalAlpha=.9;ctx.fillStyle=palette.bg;
+      ctx.fillRect(0,height<500?107:151,width,height-(height<500?144:242));ctx.restore();
+      const x=width/2,y=height*(height<500?.43:.40),small=width<600;
+      tracked(dead?'ЗАЕЗД ЗАВЕРШЁН':'МОЖНО ВЫДОХНУТЬ',x-(dead?66:76),y-37,9,palette.muted,1.5);
+      text(dead?'Врезался.':'Пауза.',x,y+15,small?45:64,palette.ink,500,'center');
+      text(dead?'Ещё раз?':'Дорога подождёт.',x,y+53,small?23:27,palette.muted,400,'center');
+      if(dead) {
+        text(Math.floor(distance/12)+' м  /  '+(isRecord?'НОВЫЙ РЕКОРД':'РЕКОРД '+best+' м'),x,y+90,11,palette.muted,400,'center',mono);
+        button('НА СТАРТ',x-105,y+116,210,46);
+      } else button('ПРОДОЛЖИТЬ',x-111,y+83,222,46);
+    }
+    function render() {
+      ctx.setTransform(dpr,0,0,dpr,0,0);ctx.fillStyle=palette.bg;ctx.fillRect(0,0,width,height);
+      ctx.lineCap='round';ctx.lineJoin='round';ui={};
+      drawScene();
+      if(state==='ready') drawReady();
+      if(state==='intro' && width>600) text('Набираем высоту наоборот.',width*.68,ground-90*scale,12,palette.muted,400,'center');
+      if(state==='running'&&gameTime<7) {
+        const message=width<600?'Взлетай заранее. Перелети всю пробку.':'Взлетай до светофора. Отпускай за последней машиной.';
+        text(message,width/2,ground+50,10,palette.muted,400,'center');
+      }
+      if(state==='dead'||state==='paused') drawOverlay();
+      drawHeader();drawFooter();
+    }
+    function inRect(x,y,r) { return r&&x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h; }
+    function activate() {
+      if(state==='ready') start();
+      else if(state==='dead'&&elapsed-deathTime>.3) {reset();return false;}
+      else if(state==='paused') resume();
+      return state==='intro'||state==='running';
+    }
+    canvas.addEventListener('pointerdown',event=>{
+      if(event.pointerType==='mouse'&&event.button!==0)return;
+      event.preventDefault();canvas.focus({preventScroll:true});
+      const box=canvas.getBoundingClientRect(),x=(event.clientX-box.left)*width/box.width,y=(event.clientY-box.top)*height/box.height;
+      if(inRect(x,y,ui.theme)){toggleTheme();return;}
+      if(inRect(x,y,ui.pause)){state==='paused'?resume():pause();return;}
+      if(activate()) {
+        pointers.add(event.pointerId);
+        try{canvas.setPointerCapture(event.pointerId);}catch(_){}
+      }
+    });
+    const release=event=>pointers.delete(event.pointerId);
+    window.addEventListener('pointerup',release);window.addEventListener('pointercancel',release);
+    canvas.addEventListener('lostpointercapture',release);
+    canvas.addEventListener('contextmenu',event=>event.preventDefault());
+    canvas.addEventListener('pointermove',event=>{
+      const box=canvas.getBoundingClientRect(),x=(event.clientX-box.left)*width/box.width,y=(event.clientY-box.top)*height/box.height;
+      canvas.style.cursor=inRect(x,y,ui.theme)||inRect(x,y,ui.pause)||state==='ready'||state==='dead'||state==='paused'?'pointer':'default';
+    });
+    window.addEventListener('keydown',event=>{
+      if(event.code==='Space'||event.code==='ArrowUp') {
+        event.preventDefault();if(event.repeat)return;
+        if(activate())keys.add(event.code);
+      } else if(event.code==='Escape'||event.code==='KeyP') {
+        event.preventDefault();if(!event.repeat){state==='paused'?resume():pause();}
+      } else if(event.code==='KeyT'&&!event.repeat) toggleTheme();
+    });
+    window.addEventListener('keyup',event=>{
+      if(event.code==='Space'||event.code==='ArrowUp'){event.preventDefault();keys.delete(event.code);}
+    });
+    window.addEventListener('blur',pause);
+    document.addEventListener('visibilitychange',()=>{if(document.hidden)pause();lastFrame=performance.now();accumulator=0;});
+    window.addEventListener('resize',resize);
+    function frame(now) {
+      const dt=Math.min((now-(lastFrame||now))/1000,.05);lastFrame=now;
+      accumulator+=dt;
+      while(accumulator>=STEP){update(STEP);accumulator-=STEP;}
+      render();requestAnimationFrame(frame);
+    }
+    applyTheme();resize();reset();requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>

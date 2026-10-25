@@ -48,8 +48,8 @@
     let palette, width = 0, height = 0, dpr = 1, margin, scale, ground, anchor;
     let state = 'ready', previousState = 'running', elapsed = 0, gameTime = 0;
     let speed = START_SPEED, distance = 0, camera = 0, air = 1, exhausted = false;
-    let rampDistance = 0, rampSpeed = 64, nextSignal = 0, deathTime = 0;
-    let obstacles = [], jams = [], ui = {}, accumulator = 0, lastFrame = 0;
+    let rampDistance = 0, rampSpeed = 64, nextTraffic = 0, deathTime = 0;
+    let obstacles = [], ui = {}, accumulator = 0, lastFrame = 0;
     let isRecord = false, bestAtStart = best;
     const keys = new Set(), pointers = new Set();
     // Tall drop from the reference ramp: short lip, then a steep elliptical quarter-turn.
@@ -126,7 +126,7 @@
       keys.clear(); pointers.clear();
       air = 1; exhausted = false; distance = 0; gameTime = 0; camera = 0;
       speed = START_SPEED; rampSpeed = 64; rampDistance = startRampDistance;
-      obstacles = []; jams = []; isRecord = false; bestAtStart = best;
+      obstacles = []; isRecord = false; bestAtStart = best;
       Object.assign(player, { x:PLAYER_START_X, y:RAMP_TOP, altitude:0, vy:0, angle:0, wheel:0, thrust:false });
       accumulator = 0;
       announce('Машина на верхней площадке. Нажмите, чтобы начать заезд.');
@@ -139,7 +139,7 @@
       state = 'running';
       player.altitude = 0; player.vy = 0; player.y = 0; player.angle = 0;
       speed = START_SPEED;
-      nextSignal = player.x + Math.max((width - margin) / scale - anchor + 180, speed * 3.5);
+      nextTraffic = player.x + Math.max((width - margin) / scale - anchor + 180, speed * 3.5);
       createJam();
       announce('Заезд начался. Перелетайте пробки целиком.');
     }
@@ -213,17 +213,15 @@
     }
     function createJam() {
       const count = 1 + Math.floor(Math.random() * 6);
-      const startX = nextSignal;
-      addObstacle('signal',startX);
-      let x = startX + 52;
+      let x = nextTraffic;
       for (let i=0; i<count; i++) {
         const type = typeNames[Math.floor(Math.random()*typeNames.length)];
         addObstacle('vehicle',x,type);
-        x += vehicleTypes[type].w + random(12,18);
+        x += vehicleTypes[type].w + (i === count-1 ? 28 : random(12,18));
       }
-      jams.push({start:startX,end:x,count});
+      addObstacle('signal',x);
       // Enough tarmac to descend from maximum altitude and refill the reservoir.
-      nextSignal = x + speed * random(3.65,4.35) + 150;
+      nextTraffic = x + 24 + speed * random(3.65,4.35) + 150;
     }
     function overlaps(a,b) {
       return a.right>=b.left && a.left<=b.right && a.bottom>=b.top && a.top<=b.bottom;
@@ -285,9 +283,8 @@
         player.y = -player.altitude;
         camera += (player.x-anchor-camera)*(1-Math.exp(-12*dt));
         const visibleEnd=camera+(width-margin)/scale;
-        if (nextSignal<visibleEnd+350) createJam();
+        if (nextTraffic<visibleEnd+350) createJam();
         obstacles=obstacles.filter(obj=>obj.box.right>camera-160);
-        jams=jams.filter(jam=>jam.end>camera-180);
         collisions();
       }
     }
@@ -474,10 +471,6 @@
       line(start,0,end,0,palette.ink,1.15);
       ctx.setLineDash([13,19]);line(start,17,end,17,palette.muted,.8);ctx.setLineDash([]);
       drawRamp();
-      for(const jam of jams) {
-        if(jam.start>end+80 || jam.end<start) continue;
-        text('ПРОБКА / '+String(jam.count).padStart(2,'0'),jam.start,-137,10,palette.muted,400,'left',mono);
-      }
       for(const obj of obstacles) {
         if(obj.box.left>end+110 || obj.box.right<start-110) continue;
         if(obj.kind==='signal') drawSignal(obj);else drawVehicle(obj);
@@ -595,7 +588,7 @@
       if(state==='ready') drawReady();
       if(state==='intro' && width>600) text('Набираем высоту наоборот.',width*.68,ground-90*scale,12,palette.muted,400,'center');
       if(state==='running'&&gameTime<7) {
-        const message=width<600?'Взлетай заранее. Перелети всю пробку.':'Взлетай до светофора. Отпускай за последней машиной.';
+        const message=width<600?'Перелети машины и светофор.':'Взлетай до первой машины. Отпускай за светофором.';
         text(message,width/2,ground+50,10,palette.muted,400,'center');
       }
       if(state==='dead'||state==='paused') drawOverlay();

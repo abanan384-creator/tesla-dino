@@ -26,6 +26,8 @@
     const canvas = document.getElementById('game');
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
+    const roadsterSprite = new Image();
+    roadsterSprite.src = 'assets/tesla-roadster-2026.png';
     const announcer = document.getElementById('announcement');
     const TAU = Math.PI * 2;
     const STEP = 1 / 120; // Fixed physics steps prevent tunnelling at low frame rates.
@@ -189,11 +191,11 @@
       return polys;
     }
     const vehicleGeometry = Object.fromEntries(typeNames.map(type => [type,geometry(type)]));
-    // Convex pieces of the wedge: low nose, dark canopy, two wheels. The roof pod is visual only.
+    // Convex pieces follow the Roadster sprite; the rear wing is decorative.
     const playerGeometry = [
-      [[66,-13],[30,-20],[-18,-22],[-54,-16],[-52,-12],[56,-12]],
-      [[24,-20],[8,-30],[-20,-34],[-38,-26],[-22,-20]],
-      circlePoly(-32,-11,11), circlePoly(42,-11,11)
+      [[66,-7],[43,-16],[-55,-19],[-58,-9],[-45,-4],[55,-4]],
+      [[34,-16],[9,-24],[-12,-24],[-30,-21],[-13,-16]],
+      circlePoly(-34,-9,9), circlePoly(41,-9,9)
     ];
     function bounds(polys) {
       let left=Infinity, right=-Infinity, top=Infinity, bottom=-Infinity;
@@ -352,6 +354,14 @@
             line(origin+i*1.8,2,origin+i*4.6,length*flutter,palette.jet,.85);
           }
         }
+      }
+      if (roadsterSprite.complete && roadsterSprite.naturalWidth) {
+        // Crop transparent padding at draw time; keep wheel contact on the road.
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(roadsterSprite,40,100,2100,510,-60,-30,128,510*128/2100);
+        ctx.restore();
+        return;
       }
       poly(carBody,palette.ink);
       poly(carGlass,palette.bg,palette.ink,1.2);

@@ -24,6 +24,7 @@ canvas{position:fixed;display:block;image-rendering:crisp-edges;image-rendering:
  STEAMLINE — one file, no assets, no libraries, no network requests.
  TWEAK HERE: TUNING.startSpeed / maxSpeed control road speed (pixels/second).
  TUNING.gravity / lift / airDrag control the float and steam thrust.
+ CAR_RENDER.divisor controls car size; WHEEL_ANIMATION controls cached wheel frames.
  MONORAIL contains every random timing, speed, direction and length range.
  All rendered coordinates are rounded. Physics stays continuous. Canvas dimensions
  adapt to orientation, and its CSS enlargement is always an INTEGER.
@@ -38,7 +39,26 @@ const TUNING=Object.freeze({startSpeed:61,maxSpeed:124,speedGain:0.42,gravity:11
 const MONORAIL=Object.freeze({idleWait:[3.5,8],birdWarning:[0.7,1.3],speed:[64,105],trainLength:[2,3],stopDuration:[2.2,5.5],side:[-1,1],travel:370,carWidth:27,carGap:2});
 // Ground line 36 is the lower edge of wheel-contact row 35 (zero-based).
 const CAR_SPRITE = Object.freeze({ width: 144, height: 36, anchorX: 72, groundLine: 36, rearWheelX: 32, frontWheelX: 118, rearNozzleX: 11, rearNozzleY: 23, startX: 84, landingDelay: 0.3 });
-const RAMP_EXIT_X = TUNING.rampEnd + CAR_SPRITE.anchorX - CAR_SPRITE.rearWheelX;
+// Keep the supplied maps intact and cache a crisp, half-size version for gameplay.
+const CAR_DIVISOR = 2;
+const CAR_RENDER = Object.freeze({
+ divisor: CAR_DIVISOR,
+ width: CAR_SPRITE.width / CAR_DIVISOR,
+ height: CAR_SPRITE.height / CAR_DIVISOR,
+ anchorX: CAR_SPRITE.anchorX / CAR_DIVISOR,
+ groundLine: CAR_SPRITE.groundLine / CAR_DIVISOR,
+ rearWheelX: Math.round(CAR_SPRITE.rearWheelX / CAR_DIVISOR),
+ frontWheelX: Math.round(CAR_SPRITE.frontWheelX / CAR_DIVISOR),
+ rearNozzleX: Math.round(CAR_SPRITE.rearNozzleX / CAR_DIVISOR),
+ rearNozzleY: Math.round(CAR_SPRITE.rearNozzleY / CAR_DIVISOR),
+ wheelRadius: 10 / CAR_DIVISOR
+});
+const WHEEL_ANIMATION = Object.freeze({ frames: 16, airDrag: 0.6 });
+const CAR_WHEELS = Object.freeze([
+ Object.freeze({ x: 32, y: 25, rimRadius: 7 }),
+ Object.freeze({ x: 118, y: 26, rimRadius: 7 })
+]);
+const RAMP_EXIT_X = TUNING.rampEnd + CAR_RENDER.anchorX - CAR_RENDER.rearWheelX;
 Object.entries(P).forEach(([name,value])=>document.documentElement.style.setProperty('--'+name,value));
 const canvas=document.getElementById('game'),ctx=canvas.getContext('2d',{alpha:false});
 const announce=document.getElementById('announcement'),restartButton=document.getElementById('restart');
@@ -180,9 +200,60 @@ function buildSprite(rows) {
  });
  return c;
 }
-// Build once. Every frame uses a three-argument drawImage: native size, no transform.
+// Preserve the full-resolution source artwork; animation caches are built below.
 const CAR_CLOSED = buildSprite(CAR_CLOSED_ROWS);
 const CAR_OPEN = buildSprite(CAR_OPEN_ROWS);
+function buildCarFrames(source) {
+ const sourcePixels = source.getContext('2d').getImageData(0, 0, source.width, source.height).data;
+ return Object.freeze(Array.from({ length: WHEEL_ANIMATION.frames }, (_, frame) => {
+  const c = makeCanvas(CAR_RENDER.width, CAR_RENDER.height);
+  const g = c.getContext('2d');
+  const pixels = g.createImageData(c.width, c.height);
+  const angle = frame * Math.PI * 2 / WHEEL_ANIMATION.frames;
+  const cosine = Math.cos(angle), sine = Math.sin(angle);
+  for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) {
+   // Nearest-neighbor sample at each output pixel's center, with no blending.
+   const sx = Math.floor((x + 0.5) * CAR_RENDER.divisor);
+   const sy = Math.floor((y + 0.5) * CAR_RENDER.divisor);
+   const original = (sy * source.width + sx) * 4;
+   let sample = original;
+   if (sourcePixels[original + 3]) for (const wheel of CAR_WHEELS) {
+    const dx = sx - wheel.x, dy = sy - wheel.y;
+    if (dx * dx + dy * dy > wheel.rimRadius * wheel.rimRadius) continue;
+    // Rotate only the spoke texture clockwise. Tires, silhouette and body stay fixed.
+    const rx = R(wheel.x + dx * cosine + dy * sine);
+    const ry = R(wheel.y - dx * sine + dy * cosine);
+    const rotated = (ry * source.width + rx) * 4;
+    if (sourcePixels[rotated + 3]) sample = rotated;
+    break;
+   }
+   const target = (y * c.width + x) * 4;
+   for (let channel = 0; channel < 4; channel++) pixels.data[target + channel] = sourcePixels[sample + channel];
+  }
+  g.putImageData(pixels, 0, 0);
+  return c;
+ }));
+}
+const CAR_FRAMES = Object.freeze({ CLOSED: buildCarFrames(CAR_CLOSED), OPEN: buildCarFrames(CAR_OPEN) });
+class WheelController {
+ constructor() { this.reset(); }
+ reset() { this.angle = 0; this.angularVelocity = 0; }
+ get frame() { return Math.floor(this.angle / (Math.PI * 2) * WHEEL_ANIMATION.frames) % WHEEL_ANIMATION.frames; }
+ update(dt, distance, grounded) {
+  if (dt <= 0) return;
+  if (grounded) {
+   this.angularVelocity = distance / dt / CAR_RENDER.wheelRadius;
+   this.angle += distance / CAR_RENDER.wheelRadius;
+  } else {
+   // Freewheel after lift-off, slowing smoothly until the tires touch down again.
+   const decay = Math.exp(-WHEEL_ANIMATION.airDrag * dt);
+   this.angle += this.angularVelocity * (1 - decay) / WHEEL_ANIMATION.airDrag;
+   this.angularVelocity *= decay;
+  }
+  this.angle = mod(this.angle, Math.PI * 2);
+ }
+}
+const wheelController = new WheelController();
 // Collision masks are also cached once. Transparent margins never cause a crash.
 function buildCollisionMask(sprite) {
  const rgba = sprite.getContext('2d').getImageData(0, 0, sprite.width, sprite.height).data;
@@ -190,7 +261,7 @@ function buildCollisionMask(sprite) {
  for (let i = 0; i < mask.length; i++) mask[i] = rgba[i * 4 + 3] === 255 ? 1 : 0;
  return mask;
 }
-const carCollisionMask = buildCollisionMask(CAR_CLOSED);
+const carCollisionMask = buildCollisionMask(CAR_FRAMES.CLOSED[0]);
 // Both states share their origin and ground line, including during the landing delay.
 class CarSpriteController {
  constructor() { this.reset(); }
@@ -401,7 +472,7 @@ const bridgeTile=makeCanvas(96,512);
 }
 function rampSurface(x){const t=clamp((x-TUNING.rampStart)/(TUNING.rampEnd-TUNING.rampStart),0,1);return roadY-TUNING.rampHeight*(1-smooth(t));}
 // Keep the original horizontal bitmap intact and rest it on the higher wheel contact.
-function carRampSurface(x){return Math.min(rampSurface(x+CAR_SPRITE.rearWheelX-CAR_SPRITE.anchorX),rampSurface(x+CAR_SPRITE.frontWheelX-CAR_SPRITE.anchorX));}
+function carRampSurface(x){return Math.min(rampSurface(x+CAR_RENDER.rearWheelX-CAR_RENDER.anchorX),rampSurface(x+CAR_RENDER.frontWheelX-CAR_RENDER.anchorX));}
 function rampSlope(x){const t=clamp((x-TUNING.rampStart)/(TUNING.rampEnd-TUNING.rampStart),0,1);return TUNING.rampHeight*6*t*(1-t)/(TUNING.rampEnd-TUNING.rampStart);}
 function drawBridge(){
  rect(ctx,0,roadY+9,W,H-roadY,P.deep);
@@ -424,9 +495,9 @@ function updateSteam(dt){
   steamBudget+=dt*(150+Math.max(0,-player.vy)*1.2);
   while(steamBudget>=3){
    steamBudget-=3;
-   emitSteam(player.x+CAR_SPRITE.rearWheelX-CAR_SPRITE.anchorX,player.y-1,rand(-13,9)-speed*0.12,rand(32,63));
-   emitSteam(player.x+CAR_SPRITE.frontWheelX-CAR_SPRITE.anchorX,player.y-1,rand(-10,13)-speed*0.12,rand(32,63));
-   emitSteam(player.x+CAR_SPRITE.rearNozzleX-CAR_SPRITE.anchorX,player.y+CAR_SPRITE.rearNozzleY-CAR_SPRITE.groundLine,rand(-58,-30),rand(-5,7));
+   emitSteam(player.x+CAR_RENDER.rearWheelX-CAR_RENDER.anchorX,player.y-1,rand(-13,9)-speed*0.12,rand(32,63));
+   emitSteam(player.x+CAR_RENDER.frontWheelX-CAR_RENDER.anchorX,player.y-1,rand(-10,13)-speed*0.12,rand(32,63));
+   emitSteam(player.x+CAR_RENDER.rearNozzleX-CAR_RENDER.anchorX,player.y+CAR_RENDER.rearNozzleY-CAR_RENDER.groundLine,rand(-58,-30),rand(-5,7));
   }
  }
 }
@@ -459,14 +530,14 @@ function drawTraffic(){for(const v of traffic)if(v.active){const x=R(v.x-camera)
 function collision(){
  // Coarse bounds first, then cached opaque pixels. The raised wing is cosmetic;
  // both spoiler states use the same body mask and can never land on a roof.
- const left=R(player.x-camera-CAR_SPRITE.anchorX),top=R(player.y-CAR_SPRITE.groundLine);
+ const left=R(player.x-camera-CAR_RENDER.anchorX),top=R(player.y-CAR_RENDER.groundLine);
  for(const v of traffic)if(v.active){
   const vx=R(v.x-camera),vy=roadY-v.sprite.h;
-  const x0=Math.max(left,vx),x1=Math.min(left+CAR_SPRITE.width,vx+v.sprite.w);
-  const y0=Math.max(top,vy),y1=Math.min(top+CAR_SPRITE.height,roadY);
+  const x0=Math.max(left,vx),x1=Math.min(left+CAR_RENDER.width,vx+v.sprite.w);
+  const y0=Math.max(top,vy),y1=Math.min(top+CAR_RENDER.height,roadY);
   if(x0>=x1||y0>=y1)continue;
   for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-   if(carCollisionMask[(y-top)*CAR_SPRITE.width+x-left]&&v.sprite.mask[(y-vy)*v.sprite.w+x-vx])return true;
+   if(carCollisionMask[(y-top)*CAR_RENDER.width+x-left]&&v.sprite.mask[(y-vy)*v.sprite.w+x-vx])return true;
   }
  }
  return false;
@@ -478,20 +549,21 @@ const keys=new Set(),pointers=new Set(),held=()=>keys.size>0||pointers.size>0;
 try{best=Math.max(0,Math.floor(Number(localStorage.getItem('steamline-best'))||0));if(!Number.isFinite(best))best=0;}catch(_){}
 function resize(){
  const oldRoad=roadY,vw=window.innerWidth,vh=window.innerHeight,portrait=vh>vw;
- // Widen the view instead of shrinking the 144px car; at most 3 city blocks show.
+ // Keep a generous road view on phones; at most 3 cached city blocks show.
  scale=Math.max(1,Math.floor(Math.min(vw/(portrait?320:480),vh/(portrait?480:180))),Math.ceil(vw/1024));
  W=Math.floor(vw/scale);H=Math.floor(vh/scale);canvas.width=W;canvas.height=H;
  safeTop=Math.ceil((parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--safe-top'))||0)/scale);
  canvas.style.width=W*scale+'px';canvas.style.height=H*scale+'px';canvas.style.left=Math.floor((vw-W*scale)/2)+'px';canvas.style.top=Math.floor((vh-H*scale)/2)+'px';ctx.imageSmoothingEnabled=false;
  roadY=R(H*(portrait?0.77:0.78));anchor=R(clamp(W*0.23,CAR_SPRITE.startX,132));player.y+=roadY-oldRoad;
  for(const p of steam)if(p.life>0)p.y+=roadY-oldRoad;
- if(phase==='running'){camera=Math.max(0,player.x-anchor);player.y=clamp(player.y,CAR_SPRITE.groundLine+Math.max(32,safeTop+24),roadY);}
+ if(phase==='running'){camera=Math.max(0,player.x-anchor);player.y=clamp(player.y,CAR_RENDER.groundLine+Math.max(32,safeTop+24),roadY);}
  if(phase==='ready')player.y=carRampSurface(player.x);
 }
 function resetGame(){
  phase='ready';camera=0;speed=0;runTime=0;score=0;rampSpeed=18;deathTimer=0;steamBudget=0;uiTime=0;paused=false;
  player.x=CAR_SPRITE.startX;player.y=carRampSurface(player.x);player.vy=0;bestAtStart=best;keys.clear();pointers.clear();
  carSpriteController.reset();
+ wheelController.reset();
  for(const v of traffic)v.active=false;for(const s of signals)s.active=false;for(const p of steam)p.life=0;vehicleCursor=0;signalCursor=0;
  const firstX=TUNING.rampEnd+Math.max(220,W*0.45);addVehicle(firstX,2);nextJam=firstX+255;
  for(let li=0;li<3;li++)layers[li].blocks.forEach((block,i)=>block.worldX=i*BW);
@@ -513,6 +585,7 @@ window.addEventListener('resize',resize);
 function update(dt){
  uiTime+=dt;if(paused)return;updateCity(dt);
  if(phase==='over'){deathTimer+=dt;updateSteam(dt);return;}
+ const previousX=player.x;
  if(phase==='launch'){
   carSpriteController.update(dt, false, false, true);
   const slope=rampSlope(player.x);rampSpeed=Math.min(96,rampSpeed+(14+slope*102)*dt);player.x+=rampSpeed*dt;player.y=carRampSurface(player.x);
@@ -523,26 +596,27 @@ function update(dt){
   const acceleration=TUNING.gravity-(held()?TUNING.lift:0)-player.vy*TUNING.airDrag;
   player.vy=clamp(player.vy+acceleration*dt,-TUNING.maxRise,TUNING.maxFall);player.y+=player.vy*dt;
   if(player.y>=roadY){player.y=roadY;player.vy=0;}
-  const ceiling=CAR_SPRITE.groundLine+Math.max(32,safeTop+24);
+  const ceiling=CAR_RENDER.groundLine+Math.max(32,safeTop+24);
   if(player.y<ceiling){player.y=ceiling;player.vy=Math.max(0,player.vy);}
   carSpriteController.update(dt, player.y < roadY, held());
   score=Math.max(0,Math.floor((player.x-RAMP_EXIT_X)/6));updateTraffic();if(collision())gameOver();
  }
+ if(phase==='launch'||phase==='running')wheelController.update(dt,player.x-previousX,phase==='launch'||player.y>=roadY);
  updateSteam(dt);
 }
 // 11 · COMPOSITION & PIXEL UI. Only the score remains during play.
 function drawPlayer(){
- const x=R(player.x-camera-CAR_SPRITE.anchorX),y=R(player.y-CAR_SPRITE.groundLine);
+ const x=R(player.x-camera-CAR_RENDER.anchorX),y=R(player.y-CAR_RENDER.groundLine);
  if(phase!=='ready'&&phase!=='launch'){
-  const width=R(clamp(116-(roadY-player.y)*0.15,50,116));
-  dither(ctx,x+CAR_SPRITE.anchorX-R(width/2),roadY+1,width,2,P.black);
+  const width=R(clamp(58-(roadY-player.y)*0.075,25,58));
+  dither(ctx,x+CAR_RENDER.anchorX-R(width/2),roadY+1,width,2,P.black);
  }
- const sprite=carSpriteController.state==='OPEN'?CAR_OPEN:CAR_CLOSED;
+ const sprite=CAR_FRAMES[carSpriteController.state][wheelController.frame];
  ctx.drawImage(sprite,x,y);
 }
 function button(t,x,y,w,h,size=1){rect(ctx,x+2,y+3,w,h,P.black);rect(ctx,x,y,w,h,P.light);rect(ctx,x,y,w-1,h-1,P.white);rect(ctx,x,y,w,1,P.white);rect(ctx,x+w-1,y,1,h,P.mid);rect(ctx,x,y+h-1,w,1,P.mid);text(ctx,t,x+R((w-textWidth(t,size))/2),y+R((h-7*size)/2),P.near,size);}
 function drawUI(){
- // Text remains readable at 1x phone scale; the car always stays native 144x36.
+ // Text remains readable at 1x phone scale; cached car frames are 72x18.
  const uiSize=scale===1?2:1;
  if(phase==='ready'){
   const titleScale=uiSize===2?4:3,ty=R(Math.max(16,(roadY-135)*0.5+7));
@@ -557,7 +631,7 @@ function drawUI(){
   centerText('ABOVE THE RUSH',subtitleY,P.light,uiSize);
   if(Math.sin(uiTime*2)>-0.75)centerText('HOLD SPACE / TOUCH',promptY,P.white,uiSize);
   centerText('RELEASE TO GLIDE',releaseY,P.mid,uiSize);
-  const ax=R(player.x-camera+CAR_SPRITE.width-CAR_SPRITE.anchorX+8),ay=R(player.y-16);line(ctx,ax,ay-3,ax+3,ay,P.mid);line(ctx,ax+3,ay,ax,ay+3,P.mid);
+  const ax=R(player.x-camera+CAR_RENDER.width-CAR_RENDER.anchorX+8),ay=R(player.y-8);line(ctx,ax,ay-3,ax+3,ay,P.mid);line(ctx,ax+3,ay,ax,ay+3,P.mid);
  }else if(phase==='over'){
   const large=uiSize===2,pw=Math.min(large?236:192,W-20),ph=large?151:109,x=R((W-pw)/2),y=R(Math.max(20,(H-ph)/2-8));
   dither(ctx,x+4,y+5,pw,ph,P.black);rect(ctx,x,y,pw,ph,P.deep);rect(ctx,x,y,pw,1,P.mid);rect(ctx,x,y,1,ph,P.dark);

@@ -24,6 +24,7 @@ canvas{position:fixed;display:block;image-rendering:crisp-edges;image-rendering:
  STEAMLINE — one file, no assets, no libraries, no network requests.
  TWEAK HERE: TUNING.startSpeed / maxSpeed control road speed (pixels/second).
  TUNING.gravity / lift / airDrag control the float and steam thrust.
+ TUNING.launchResponse / launchEase control the smooth start and ramp roll-out.
  CAR_RENDER.divisor controls car size; WHEEL_ANIMATION controls cached wheel frames.
  MONORAIL contains every random timing, speed, direction and length range.
  All rendered coordinates are rounded. Physics stays continuous. Canvas dimensions
@@ -35,7 +36,7 @@ canvas{position:fixed;display:block;image-rendering:crisp-edges;image-rendering:
 const PALETTE = Object.freeze({ W:'#FFFFFF', G:'#EEEEEE', L:'#C8C8C8', M:'#828282', D:'#464646', K:'#141414', N:'#080808' });
 // Existing environment and signal colors remain separate from the car artwork.
 const P=Object.freeze({white:'#FFFFFF',light:'#C7C7C7',mid:'#858585',dark:'#484848',near:'#252525',deep:'#131313',black:'#000000',red:'#E03131',redDim:'#702020',green:'#37B24D',greenDim:'#1B5927'});
-const TUNING=Object.freeze({startSpeed:61,maxSpeed:124,speedGain:0.42,gravity:112,lift:245,airDrag:1.8,maxRise:66,maxFall:62,rampStart:156,rampEnd:330,rampHeight:58,step:1/120,blockWidth:512,blockHeight:220,blockCount:4,steamCapacity:360,vehicleCapacity:48,signalCapacity:16});
+const TUNING=Object.freeze({startSpeed:61,maxSpeed:124,speedGain:0.42,gravity:112,lift:245,airDrag:1.8,maxRise:66,maxFall:62,rampStart:156,rampEnd:330,rampHeight:58,launchResponse:0.65,launchEase:0.6,speedResponse:0.7,cameraFollow:7,step:1/120,blockWidth:512,blockHeight:220,blockCount:4,steamCapacity:360,vehicleCapacity:48,signalCapacity:16});
 const MONORAIL=Object.freeze({idleWait:[3.5,8],birdWarning:[0.7,1.3],speed:[64,105],trainLength:[2,3],stopDuration:[2.2,5.5],side:[-1,1],travel:370,carWidth:27,carGap:2});
 // Ground line 36 is the lower edge of wheel-contact row 35 (zero-based).
 const CAR_SPRITE = Object.freeze({ width: 144, height: 36, anchorX: 72, groundLine: 36, rearWheelX: 32, frontWheelX: 118, rearNozzleX: 11, rearNozzleY: 23, startX: 84, landingDelay: 0.3 });
@@ -55,9 +56,10 @@ const CAR_RENDER = Object.freeze({
 });
 const WHEEL_ANIMATION = Object.freeze({ frames: 16, airDrag: 0.6 });
 const CAR_WHEELS = Object.freeze([
- Object.freeze({ x: 32, y: 25, rimRadius: 7 }),
- Object.freeze({ x: 118, y: 26, rimRadius: 7 })
+ Object.freeze({ x: 32, y: 26, rimRadius: 7, tireRadius: 9 }),
+ Object.freeze({ x: 118, y: 26, rimRadius: 7, tireRadius: 9 })
 ]);
+const RAMP_ART = Object.freeze({ steps: 17, angleStep: Math.PI / 90, width: 96, height: 64, originX: 48, originY: 44 });
 const RAMP_EXIT_X = TUNING.rampEnd + CAR_RENDER.anchorX - CAR_RENDER.rearWheelX;
 Object.entries(P).forEach(([name,value])=>document.documentElement.style.setProperty('--'+name,value));
 const canvas=document.getElementById('game'),ctx=canvas.getContext('2d',{alpha:false});
@@ -205,6 +207,7 @@ const CAR_CLOSED = buildSprite(CAR_CLOSED_ROWS);
 const CAR_OPEN = buildSprite(CAR_OPEN_ROWS);
 function buildCarFrames(source) {
  const sourcePixels = source.getContext('2d').getImageData(0, 0, source.width, source.height).data;
+ const frontWheel = CAR_WHEELS[1];
  return Object.freeze(Array.from({ length: WHEEL_ANIMATION.frames }, (_, frame) => {
   const c = makeCanvas(CAR_RENDER.width, CAR_RENDER.height);
   const g = c.getContext('2d');
@@ -217,14 +220,18 @@ function buildCarFrames(source) {
    const sy = Math.floor((y + 0.5) * CAR_RENDER.divisor);
    const original = (sy * source.width + sx) * 4;
    let sample = original;
-   if (sourcePixels[original + 3]) for (const wheel of CAR_WHEELS) {
+   for (const wheel of CAR_WHEELS) {
     const dx = sx - wheel.x, dy = sy - wheel.y;
-    if (dx * dx + dy * dy > wheel.rimRadius * wheel.rimRadius) continue;
-    // Rotate only the spoke texture clockwise. Tires, silhouette and body stay fixed.
-    const rx = R(wheel.x + dx * cosine + dy * sine);
-    const ry = R(wheel.y - dx * sine + dy * cosine);
-    const rotated = (ry * source.width + rx) * 4;
-    if (sourcePixels[rotated + 3]) sample = rotated;
+    const radiusSquared = dx * dx + dy * dy;
+    if (radiusSquared > wheel.tireRadius * wheel.tireRadius) continue;
+    // Both wheels use the front wheel's tire, bright rim and spoke design.
+    sample = ((frontWheel.y + dy) * source.width + frontWheel.x + dx) * 4;
+    if (radiusSquared <= wheel.rimRadius * wheel.rimRadius) {
+     const rx = R(frontWheel.x + dx * cosine + dy * sine);
+     const ry = R(frontWheel.y - dx * sine + dy * cosine);
+     const rotated = (ry * source.width + rx) * 4;
+     if (sourcePixels[rotated + 3]) sample = rotated;
+    }
     break;
    }
    const target = (y * c.width + x) * 4;
@@ -235,6 +242,29 @@ function buildCarFrames(source) {
  }));
 }
 const CAR_FRAMES = Object.freeze({ CLOSED: buildCarFrames(CAR_CLOSED), OPEN: buildCarFrames(CAR_OPEN) });
+// Cache ramp pitch together with all wheel phases; drawing still only copies pixels.
+function buildRampFrames() {
+ return Object.freeze(Array.from({ length: RAMP_ART.steps }, (_, step) => {
+  if (step === 0) return CAR_FRAMES.CLOSED;
+  const angle = step * RAMP_ART.angleStep, cosine = Math.cos(angle), sine = Math.sin(angle);
+  return Object.freeze(CAR_FRAMES.CLOSED.map(source => {
+   const sourcePixels = source.getContext('2d').getImageData(0, 0, source.width, source.height).data;
+   const c = makeCanvas(RAMP_ART.width, RAMP_ART.height), g = c.getContext('2d');
+   const pixels = g.createImageData(c.width, c.height);
+   for (let y = 0; y < c.height; y++) for (let x = 0; x < c.width; x++) {
+    const dx = x - RAMP_ART.originX, dy = y - RAMP_ART.originY;
+    const sx = R(dx * cosine + dy * sine + CAR_RENDER.anchorX);
+    const sy = R(-dx * sine + dy * cosine + CAR_RENDER.groundLine);
+    if (sx < 0 || sx >= source.width || sy < 0 || sy >= source.height) continue;
+    const from = (sy * source.width + sx) * 4, to = (y * c.width + x) * 4;
+    for (let channel = 0; channel < 4; channel++) pixels.data[to + channel] = sourcePixels[from + channel];
+   }
+   g.putImageData(pixels, 0, 0);
+   return c;
+  }));
+ }));
+}
+const RAMP_FRAMES = buildRampFrames();
 class WheelController {
  constructor() { this.reset(); }
  reset() { this.angle = 0; this.angularVelocity = 0; }
@@ -471,9 +501,23 @@ const bridgeTile=makeCanvas(96,512);
  line(g,0,17,46,43,P.dark);line(g,46,43,94,17,P.dark);line(g,0,18,46,44,P.near);line(g,46,44,94,18,P.near);rect(g,43,17,10,495,P.near);rect(g,43,17,3,495,P.mid);rect(g,46,17,2,495,P.dark);rect(g,38,17,20,4,P.dark);rect(g,38,17,20,1,P.mid);dither(g,43,24,3,488,P.dark);rect(g,9,6,17,1,P.light);rect(g,57,6,17,1,P.light);
 }
 function rampSurface(x){const t=clamp((x-TUNING.rampStart)/(TUNING.rampEnd-TUNING.rampStart),0,1);return roadY-TUNING.rampHeight*(1-smooth(t));}
-// Keep the original horizontal bitmap intact and rest it on the higher wheel contact.
-function carRampSurface(x){return Math.min(rampSurface(x+CAR_RENDER.rearWheelX-CAR_RENDER.anchorX),rampSurface(x+CAR_RENDER.frontWheelX-CAR_RENDER.anchorX));}
-function rampSlope(x){const t=clamp((x-TUNING.rampStart)/(TUNING.rampEnd-TUNING.rampStart),0,1);return TUNING.rampHeight*6*t*(1-t)/(TUNING.rampEnd-TUNING.rampStart);}
+function placeCarOnRamp() {
+ const rear = CAR_RENDER.rearWheelX - CAR_RENDER.anchorX;
+ const front = CAR_RENDER.frontWheelX - CAR_RENDER.anchorX;
+ const radius = CAR_RENDER.wheelRadius;
+ let angle = player.angle;
+ // Solve the pitch at both tire contact points, so the front wheel cannot float.
+ for (let i = 0; i < 6; i++) {
+  const cosine = Math.cos(angle), sine = Math.sin(angle);
+  const rearY = rampSurface(player.x + rear * cosine + radius * sine);
+  const frontY = rampSurface(player.x + front * cosine + radius * sine);
+  angle = Math.atan2(frontY - rearY, (front - rear) * cosine);
+ }
+ const sine = Math.sin(angle), cosine = Math.cos(angle);
+ const rearY = rampSurface(player.x + rear * cosine + radius * sine);
+ player.y = rearY - rear * sine - radius * (1 - cosine);
+ player.angle = angle;
+}
 function drawBridge(){
  rect(ctx,0,roadY+9,W,H-roadY,P.deep);
  const under=layers[3].under,offset=R(mod(camera*0.45,BW));for(let x=-offset;x<W;x+=BW)ctx.drawImage(under,x,roadY+9);
@@ -543,8 +587,8 @@ function collision(){
  return false;
 }
 // 10 · PHYSICS, INPUT & PERSISTENCE. Fixed timestep with focus-safe hold controls.
-let phase='ready',camera=0,speed=0,runTime=0,score=0,best=0,rampSpeed=18,deathTimer=0;
-const player={x:CAR_SPRITE.startX,y:0,vy:0};let uiTime=0,bestAtStart=0,paused=false;
+let phase='ready',camera=0,speed=0,runTime=0,score=0,best=0,rampSpeed=0,launchElapsed=0,deathTimer=0;
+const player={x:CAR_SPRITE.startX,y:0,vy:0,angle:0};let uiTime=0,bestAtStart=0,paused=false;
 const keys=new Set(),pointers=new Set(),held=()=>keys.size>0||pointers.size>0;
 try{best=Math.max(0,Math.floor(Number(localStorage.getItem('steamline-best'))||0));if(!Number.isFinite(best))best=0;}catch(_){}
 function resize(){
@@ -557,11 +601,11 @@ function resize(){
  roadY=R(H*(portrait?0.77:0.78));anchor=R(clamp(W*0.23,CAR_SPRITE.startX,132));player.y+=roadY-oldRoad;
  for(const p of steam)if(p.life>0)p.y+=roadY-oldRoad;
  if(phase==='running'){camera=Math.max(0,player.x-anchor);player.y=clamp(player.y,CAR_RENDER.groundLine+Math.max(32,safeTop+24),roadY);}
- if(phase==='ready')player.y=carRampSurface(player.x);
+ if(phase==='ready'||phase==='launch')placeCarOnRamp();
 }
 function resetGame(){
- phase='ready';camera=0;speed=0;runTime=0;score=0;rampSpeed=18;deathTimer=0;steamBudget=0;uiTime=0;paused=false;
- player.x=CAR_SPRITE.startX;player.y=carRampSurface(player.x);player.vy=0;bestAtStart=best;keys.clear();pointers.clear();
+ phase='ready';camera=0;speed=0;runTime=0;score=0;rampSpeed=0;launchElapsed=0;deathTimer=0;steamBudget=0;uiTime=0;paused=false;
+ player.x=CAR_SPRITE.startX;player.angle=0;placeCarOnRamp();player.vy=0;bestAtStart=best;keys.clear();pointers.clear();
  carSpriteController.reset();
  wheelController.reset();
  for(const v of traffic)v.active=false;for(const s of signals)s.active=false;for(const p of steam)p.life=0;vehicleCursor=0;signalCursor=0;
@@ -588,11 +632,20 @@ function update(dt){
  const previousX=player.x;
  if(phase==='launch'){
   carSpriteController.update(dt, false, false, true);
-  const slope=rampSlope(player.x);rampSpeed=Math.min(96,rampSpeed+(14+slope*102)*dt);player.x+=rampSpeed*dt;player.y=carRampSurface(player.x);
-  const target=Math.max(0,player.x-anchor);camera+=(target-camera)*(1-Math.exp(-6*dt));
-  if(player.x>=RAMP_EXIT_X){phase='running';speed=TUNING.startSpeed;player.y=roadY;player.vy=0;}
+  launchElapsed+=dt;
+  const progress=clamp((player.x-CAR_SPRITE.startX)/(RAMP_EXIT_X-CAR_SPRITE.startX),0,1);
+  const targetSpeed=TUNING.startSpeed*(0.7+0.3*smooth(progress))*smooth(clamp(launchElapsed/TUNING.launchEase,0,1));
+  const previousSpeed=rampSpeed;
+  rampSpeed+=(targetSpeed-rampSpeed)*(1-Math.exp(-dt/TUNING.launchResponse));
+  player.x+=(previousSpeed+rampSpeed)*0.5*dt;
+  placeCarOnRamp();
+  const target=Math.max(0,player.x-anchor);camera+=(target-camera)*(1-Math.exp(-TUNING.cameraFollow*dt));
+  if(player.x>=RAMP_EXIT_X){phase='running';speed=rampSpeed;player.y=roadY;player.vy=0;player.angle=0;}
  }else if(phase==='running'){
-  runTime+=dt;speed=Math.min(TUNING.maxSpeed,TUNING.startSpeed+runTime*TUNING.speedGain);player.x+=speed*dt;camera+=(Math.max(0,player.x-anchor)-camera)*(1-Math.exp(-9*dt));
+  runTime+=dt;
+  const targetSpeed=Math.min(TUNING.maxSpeed,TUNING.startSpeed+runTime*TUNING.speedGain);
+  speed+=(targetSpeed-speed)*(1-Math.exp(-dt/TUNING.speedResponse));
+  player.x+=speed*dt;camera+=(Math.max(0,player.x-anchor)-camera)*(1-Math.exp(-TUNING.cameraFollow*dt));
   const acceleration=TUNING.gravity-(held()?TUNING.lift:0)-player.vy*TUNING.airDrag;
   player.vy=clamp(player.vy+acceleration*dt,-TUNING.maxRise,TUNING.maxFall);player.y+=player.vy*dt;
   if(player.y>=roadY){player.y=roadY;player.vy=0;}
@@ -606,6 +659,13 @@ function update(dt){
 }
 // 11 · COMPOSITION & PIXEL UI. Only the score remains during play.
 function drawPlayer(){
+ if(phase==='launch'){
+  const tilt=clamp(R(player.angle/RAMP_ART.angleStep),0,RAMP_ART.steps-1);
+  if(tilt>0){
+   ctx.drawImage(RAMP_FRAMES[tilt][wheelController.frame],R(player.x-camera-RAMP_ART.originX),R(player.y-RAMP_ART.originY));
+   return;
+  }
+ }
  const x=R(player.x-camera-CAR_RENDER.anchorX),y=R(player.y-CAR_RENDER.groundLine);
  if(phase!=='ready'&&phase!=='launch'){
   const width=R(clamp(58-(roadY-player.y)*0.075,25,58));
